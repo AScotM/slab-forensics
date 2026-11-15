@@ -14,6 +14,7 @@ import (
 	"math"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -149,6 +150,7 @@ type Config struct {
 	Strict       bool
 	Pretty       bool
 	Verbose      bool
+	Color        bool
 }
 
 var sysfsNumeric = []string{
@@ -188,8 +190,9 @@ func run(args []string) error {
 	fs.BoolVar(&cfg.Strict, "strict", false, "fail on inaccessible optional files")
 	fs.BoolVar(&cfg.Pretty, "pretty", true, "indent JSON output")
 	fs.BoolVar(&cfg.Verbose, "verbose", false, "print additional details")
+	fs.BoolVar(&cfg.Color, "color", false, "ANSI truecolor for topology")
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "slab-forensics [flags] [snapshot|top|analyze|compare|watch|baseline|caches|memory|zones|buddy|diff|help]")
+		fmt.Fprintln(os.Stderr, "slab-forensics [flags] [snapshot|top|analyze|compare|watch|baseline|caches|memory|zones|buddy|diff|topology|help]")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
@@ -203,6 +206,11 @@ func run(args []string) error {
 		fs.Usage()
 		return nil
 	}
+	switch cmd {
+	case "snapshot", "top", "analyze", "compare", "watch", "baseline", "caches", "memory", "zones", "buddy", "diff", "topology":
+	default:
+		return fmt.Errorf("unknown command %q", cmd)
+	}
 	switch cfg.Format {
 	case "table", "json", "jsonl", "csv":
 	default:
@@ -214,13 +222,13 @@ func run(args []string) error {
 	if cfg.Interval <= 0 {
 		return errors.New("interval must be positive")
 	}
-	if cfg.LowUtil < 0 || cfg.LowUtil > 100 {
+	if math.IsNaN(cfg.LowUtil) || math.IsInf(cfg.LowUtil, 0) || cfg.LowUtil < 0 || cfg.LowUtil > 100 {
 		return errors.New("low-util must be between 0 and 100")
 	}
 	if cfg.Count < 0 {
 		return errors.New("count must not be negative")
 	}
-	if cfg.HighPSI < 0 {
+	if math.IsNaN(cfg.HighPSI) || math.IsInf(cfg.HighPSI, 0) || cfg.HighPSI < 0 {
 		return errors.New("high-psi must not be negative")
 	}
 	var re *regexp.Regexp
@@ -258,6 +266,9 @@ func run(args []string) error {
 		return saveSnapshot(cfg.Output, snap)
 	}
 	rep := analyze(snap, baseline, cfg)
+	if cmd == "compare" || cmd == "diff" {
+		return emitDiff(cfg, snap, *baseline, re)
+	}
 	return emit(cfg, cmd, rep, re)
 }
 
@@ -607,6 +618,12 @@ func metric(c Cache, pageSize uint64) Metric {
 	if c.TotalSlabs > 0 && c.PagesPerSlab > 0 {
 		reserved = satMul(satMul(c.TotalSlabs, c.PagesPerSlab), pageSize)
 	}
+	if reserved == allocated && c.ObjectsPerSlab > 0 && c.PagesPerSlab > 0 && c.TotalObjects > 0 {
+		slabs := (c.TotalObjects + c.ObjectsPerSlab - 1) / c.ObjectsPerSlab
+		if slabs > 0 {
+			reserved = satMul(satMul(slabs, c.PagesPerSlab), pageSize)
+		}
+	}
 	if reserved < allocated {
 		reserved = allocated
 	}
@@ -775,7 +792,7 @@ func emit(cfg Config, cmd string, rep Report, re *regexp.Regexp) error {
 			enc.SetIndent("", "  ")
 		}
 		switch cmd {
-		case "caches", "top":
+		case "caches", "top", "topology":
 			return enc.Encode(metrics)
 		case "memory", "zones", "buddy":
 			if cmd == "zones" {
@@ -795,7 +812,13 @@ func emit(cfg Config, cmd string, rep Report, re *regexp.Regexp) error {
 		}
 	}
 	if cfg.Format == "csv" {
+		if cmd == "memory" || cmd == "zones" || cmd == "buddy" {
+			return emitMemoryCSV(w, cmd, rep.Snapshot.Memory)
+		}
 		return emitCSV(w, cmd, rep, metrics)
+	}
+	if cmd == "topology" {
+		return emitTopology(w, metrics, cfg)
 	}
 	return emitTable(w, cmd, rep, metrics, cfg)
 }
@@ -956,32 +979,77 @@ func saveSnapshot(path string, s Snapshot) error {
 }
 
 func watch(cfg Config, re *regexp.Regexp, baseline *Snapshot) error {
-	count := 0
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	var writer io.Writer = os.Stdout
+	if cfg.Output != "-" {
+		f, err := os.OpenFile(cfg.Output, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		writer = f
+	}
 	var previous *Snapshot
-	for cfg.Count == 0 || count < cfg.Count {
+	for count := 0; cfg.Count == 0 || count < cfg.Count; count++ {
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+		}
 		s, err := obtain(cfg)
 		if err != nil {
 			return err
 		}
-		compare := baseline
-		if compare == nil {
-			compare = previous
+		ref := baseline
+		if ref == nil {
+			ref = previous
 		}
-		r := analyze(s, compare, cfg)
-		if count > 0 && cfg.Format == "table" {
-			fmt.Println("\n---")
-		}
-		if err := emit(cfg, "snapshot", r, re); err != nil {
+		rep := analyze(s, ref, cfg)
+		var buf bytes.Buffer
+		sampleCfg := cfg
+		sampleCfg.Output = "-"
+		if err := emitTo(&buf, sampleCfg, "snapshot", rep, re); err != nil {
 			return err
 		}
-		count++
+		if count > 0 && cfg.Format == "table" {
+			if _, err = fmt.Fprintln(writer, "\n---"); err != nil {
+				return err
+			}
+		}
+		if _, err = writer.Write(buf.Bytes()); err != nil {
+			return err
+		}
 		previous = &s
-		if cfg.Count > 0 && count >= cfg.Count {
+		if cfg.Count > 0 && count+1 >= cfg.Count {
 			break
 		}
-		time.Sleep(cfg.Interval)
+		timer := time.NewTimer(cfg.Interval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil
+		case <-timer.C:
+		}
 	}
 	return nil
+}
+
+func emitTo(w io.Writer, cfg Config, cmd string, rep Report, re *regexp.Regexp) error {
+	metrics := filterMetrics(rep.Metrics, cfg, re)
+	switch cfg.Format {
+	case "json", "jsonl":
+		enc := json.NewEncoder(w)
+		enc.SetEscapeHTML(false)
+		if cfg.Format == "json" && cfg.Pretty {
+			enc.SetIndent("", "  ")
+		}
+		return enc.Encode(rep)
+	case "csv":
+		return emitCSV(w, cmd, rep, metrics)
+	default:
+		return emitTable(w, cmd, rep, metrics, cfg)
+	}
 }
 
 func fingerprint(s Snapshot) string {
@@ -1063,4 +1131,179 @@ func maxU(a, b uint64) uint64 {
 		return a
 	}
 	return b
+}
+func emitDiff(cfg Config, current, baseline Snapshot, re *regexp.Regexp) error {
+	type delta struct {
+		Name           string `json:"name"`
+		Status         string `json:"status"`
+		ReservedBefore uint64 `json:"reserved_before"`
+		ReservedAfter  uint64 `json:"reserved_after"`
+		ReservedDelta  int64  `json:"reserved_delta"`
+		ActiveDelta    int64  `json:"active_objects_delta"`
+	}
+	old := map[string]Metric{}
+	now := map[string]Metric{}
+	for _, c := range baseline.Caches {
+		old[c.Name] = metric(c, baseline.PageSize)
+	}
+	for _, c := range current.Caches {
+		now[c.Name] = metric(c, current.PageSize)
+	}
+	names := map[string]bool{}
+	for k := range old {
+		names[k] = true
+	}
+	for k := range now {
+		names[k] = true
+	}
+	rows := make([]delta, 0, len(names))
+	for name := range names {
+		if re != nil && !re.MatchString(name) {
+			continue
+		}
+		a, aok := now[name]
+		b, bok := old[name]
+		status := "changed"
+		if !aok {
+			status = "removed"
+		} else if !bok {
+			status = "added"
+		} else if a.ReservedBytes == b.ReservedBytes && a.ActiveObjects == b.ActiveObjects {
+			status = "unchanged"
+		}
+		if a.ReservedBytes < cfg.MinBytes && b.ReservedBytes < cfg.MinBytes {
+			continue
+		}
+		rows = append(rows, delta{name, status, b.ReservedBytes, a.ReservedBytes, signedDiff(a.ReservedBytes, b.ReservedBytes), signedDiff(a.ActiveObjects, b.ActiveObjects)})
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].ReservedDelta != rows[j].ReservedDelta {
+			return rows[i].ReservedDelta > rows[j].ReservedDelta
+		}
+		return rows[i].Name < rows[j].Name
+	})
+	if cfg.Limit > 0 && len(rows) > cfg.Limit {
+		rows = rows[:cfg.Limit]
+	}
+	var w io.Writer = os.Stdout
+	if cfg.Output != "-" {
+		f, err := os.Create(cfg.Output)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		w = f
+	}
+	switch cfg.Format {
+	case "json", "jsonl":
+		enc := json.NewEncoder(w)
+		if cfg.Format == "json" && cfg.Pretty {
+			enc.SetIndent("", "  ")
+		}
+		return enc.Encode(rows)
+	case "csv":
+		cw := csv.NewWriter(w)
+		if err := cw.Write([]string{"name", "status", "reserved_before", "reserved_after", "reserved_delta", "active_objects_delta"}); err != nil {
+			return err
+		}
+		for _, r := range rows {
+			if err := cw.Write([]string{r.Name, r.Status, fmt.Sprint(r.ReservedBefore), fmt.Sprint(r.ReservedAfter), fmt.Sprint(r.ReservedDelta), fmt.Sprint(r.ActiveDelta)}); err != nil {
+				return err
+			}
+		}
+		cw.Flush()
+		return cw.Error()
+	default:
+		tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
+		fmt.Fprintln(tw, "CACHE\tSTATUS\tBEFORE\tAFTER\tRESERVED DELTA\tACTIVE OBJECT DELTA")
+		for _, r := range rows {
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%d\n", r.Name, r.Status, human(r.ReservedBefore), human(r.ReservedAfter), humanSigned(r.ReservedDelta), r.ActiveDelta)
+		}
+		return tw.Flush()
+	}
+}
+
+func emitMemoryCSV(w io.Writer, cmd string, m Memory) error {
+	cw := csv.NewWriter(w)
+	if cmd == "memory" {
+		if err := cw.Write([]string{"field", "value", "unit"}); err != nil {
+			return err
+		}
+		for _, k := range sortedKeys(m.Fields) {
+			if err := cw.Write([]string{k, fmt.Sprint(m.Fields[k]), "KiB"}); err != nil {
+				return err
+			}
+		}
+		for _, k := range sortedKeys(m.VMStat) {
+			if err := cw.Write([]string{"vmstat_" + k, fmt.Sprint(m.VMStat[k]), "raw"}); err != nil {
+				return err
+			}
+		}
+	}
+	if cmd == "zones" {
+		if err := cw.Write([]string{"node", "zone", "field", "value"}); err != nil {
+			return err
+		}
+		for _, z := range m.ZoneInfo {
+			for _, k := range sortedKeys(z.Pages) {
+				if err := cw.Write([]string{fmt.Sprint(z.Node), z.Name, k, fmt.Sprint(z.Pages[k])}); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	if cmd == "buddy" {
+		if err := cw.Write([]string{"node", "zone", "order", "free_blocks"}); err != nil {
+			return err
+		}
+		for _, b := range m.Buddy {
+			for i, v := range b.Orders {
+				if err := cw.Write([]string{fmt.Sprint(b.Node), b.Zone, fmt.Sprint(i), fmt.Sprint(v)}); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	cw.Flush()
+	return cw.Error()
+}
+
+func emitTopology(w io.Writer, metrics []Metric, cfg Config) error {
+	if _, err := fmt.Fprintln(w, "SLAB CACHE TOPOLOGY | active objects / allocated slots"); err != nil {
+		return err
+	}
+	for _, m := range metrics {
+		ratio := 0.0
+		if m.TotalObjects > 0 {
+			ratio = float64(m.ActiveObjects) / float64(m.TotalObjects)
+		}
+		ratio = clamp(ratio, 0, 1)
+		filled := int(math.Round(32 * ratio))
+		if filled > 32 {
+			filled = 32
+		}
+		var bar strings.Builder
+		for i := 0; i < 32; i++ {
+			ch := "░"
+			if i < filled {
+				ch = "█"
+			}
+			if cfg.Color {
+				if i < filled {
+					fmt.Fprintf(&bar, "\x1b[38;2;%d;%d;%dm%s", int(230*(1-ratio)+30), int(200*ratio+35), 115, ch)
+				} else {
+					bar.WriteString("\x1b[38;2;70;75;90m" + ch)
+				}
+			} else {
+				bar.WriteString(ch)
+			}
+		}
+		if cfg.Color {
+			bar.WriteString("\x1b[0m")
+		}
+		if _, err := fmt.Fprintf(w, "%-28.28s %s %6.2f%% %12s\n", m.Name, bar.String(), 100*ratio, human(m.ReservedBytes)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
